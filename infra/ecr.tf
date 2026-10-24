@@ -3,7 +3,7 @@
 resource "aws_ecr_repository" "app" {
   #checkov:skip=CKV_AWS_136:AES256 (AWS-owned key) chosen over a KMS CMK to stay ~$0; accepted risk for a portfolio repo
   name                 = var.ecr_repo_name
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
   force_delete         = true # lets `terraform destroy` clean up; would be false in prod
 
   image_scanning_configuration {
