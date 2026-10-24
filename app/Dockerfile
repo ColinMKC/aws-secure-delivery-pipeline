@@ -2,4 +2,6 @@
 # Tags are mutable; digests are not (same lesson as pinning Actions to SHAs).
 FROM public.ecr.aws/lambda/python:3.12
 COPY app.py ${LAMBDA_TASK_ROOT}/
+# T4: never run as root (numeric UID; base image has no useradd)
+USER 1000:1000
 CMD ["app.handler"]
