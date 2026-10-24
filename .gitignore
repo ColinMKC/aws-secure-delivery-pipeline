@@ -1,0 +1,12 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+# Secrets / local
+.env
+*.pem
+sbom.*.json
+__pycache__/

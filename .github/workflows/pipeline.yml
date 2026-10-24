@@ -1,0 +1,117 @@
+name: secure-pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege by default; jobs opt in to more.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPO: aws-secure-delivery-pipeline
+  FUNCTION_NAME: secure-delivery-app
+
+# TODO (Stage 2): pin every third-party action to a full commit SHA.
+# Tags are mutable — a hijacked tag is a classic CI supply-chain attack.
+
+jobs:
+  scan:
+    name: Security gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks scans history, not just the tip
+
+      - name: Secrets — gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SAST — Semgrep
+        run: pipx run semgrep scan --config p/python --config p/dockerfile --error app/
+
+      - name: IaC — Checkov
+        run: pipx run checkov -d infra --framework terraform --compact --quiet
+
+      - name: Build image
+        run: docker build -t app:${{ github.sha }} app/
+
+      - name: Image scan — Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: app:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  deploy:
+    name: Sign & deploy (main only)
+    needs: scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC token for AWS + cosign keyless signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS creds via OIDC (no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push (immutable tag = commit SHA)
+        id: push
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPO}:${GITHUB_SHA}"
+          docker build -t "$IMAGE" app/
+          docker push "$IMAGE"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "ref=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # Scan the exact digest we are about to sign — closes the scan→deploy gap (T6).
+      - name: Re-scan pushed digest — Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.push.outputs.ref }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: SBOM — Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.push.outputs.ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image + attach SBOM (keyless)
+        run: |
+          cosign sign --yes "${{ steps.push.outputs.ref }}"
+          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${{ steps.push.outputs.ref }}"
+
+      - name: Verify signature before deploy (gate)
+        run: |
+          cosign verify "${{ steps.push.outputs.ref }}" \
+            --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Deploy to Lambda by digest
+        run: |
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            aws lambda update-function-code --function-name "$FUNCTION_NAME" \
+              --image-uri "${{ steps.push.outputs.ref }}"
+          else
+            echo "::notice::Function not created yet — Stage 4: set image_uri=${{ steps.push.outputs.ref }} and terraform apply"
+          fi
